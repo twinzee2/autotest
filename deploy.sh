@@ -12,7 +12,7 @@ set -euo pipefail
 CTID=103                         # ID контейнера (уникальный)
 HOSTNAME="dashy-container"      # hostname внутри контейнера
 STORAGE="local-lvm"             # хранилище для rootfs (local, local-lvm и т.п.)
-DISKSIZE=16                      # размер диска в GB
+DISKSIZE=15                      # размер диска в GB
 MEMORY=4096                      # MB
 CORES=4                          # vCPU
 BRIDGE="vmbr0"                 # мост на хосте Proxmox
