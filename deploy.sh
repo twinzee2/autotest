@@ -9,7 +9,7 @@ set -euo pipefail
 #########################
 # Настройки (подредактируйте)
 #########################
-CTID=100                         # ID контейнера (уникальный)
+CTID=101                         # ID контейнера (уникальный)
 HOSTNAME="dashy-container"      # hostname внутри контейнера
 STORAGE="local-lvm"             # хранилище для rootfs (local, local-lvm и т.п.)
 DISKSIZE=16                      # размер диска в GB
