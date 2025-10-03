@@ -1,34 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# ---- Настройки (подкорректируй) ----
+
+# ========== ШАГ 0. Фикс локалей / шрифтов ==========
+echo ">>> Настройка UTF-8 локали..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y locales console-data
+sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+locale-gen en_US.UTF-8
+update-locale LANG=en_US.UTF-8
+export LANG=en_US.UTF-8
+echo ">>> Локаль выставлена: $LANG"
+
+# ========== ШАГ 1. Настройки ==========
 CTID=101
 NODE=$(hostname)
-STORAGE=local          # proxmox storage, например local, local-lvm, SSD и т.д.
+STORAGE=local
 ROOTFS_GB=16
-HOSTNAME="node"
-PASSWORD="root"
+HOSTNAME="dashy-node"
+PASSWORD="ChangeMeStrong!"
 CORES=2
-MEMORY=2048            # MB
+MEMORY=2048
 BRIDGE=vmbr0
-# ------------------------------------
 
-echo "1) Обновим список шаблонов..."
+# ========== ШАГ 2. Поиск и загрузка шаблона ==========
+echo ">>> Обновляем список LXC шаблонов..."
 pveam update
 
-# Попробуем найти свежий debian-12 template (если не нашли — вручную выставь TEMPLATE_NAME)
-TEMPLATE_NAME=$(pveam available | awk '/debian-12-standard/ {print $1; exit}')
-if [ -z "$TEMPLATE_NAME" ]; then
-  echo "Не найден debian-12 шаблон. Выполни 'pveam available' и укажи TEMPLATE_NAME вручную."
-  exit 1
+TEMPLATE_NAME=$(pveam available | grep -m1 debian-12-standard | awk '{print $2}')
+if [ -z "${TEMPLATE_NAME}" ]; then
+  echo ">>> Шаблон debian-12-standard не найден в списке, пробуем напрямую..."
+  TEMPLATE_NAME="debian-12-standard_12.7-1_amd64.tar.zst"
 fi
-echo "Найден шаблон: $TEMPLATE_NAME"
-echo "Скачиваем шаблон на хост storage=${STORAGE}..."
-pveam download ${STORAGE} ${TEMPLATE_NAME}
 
+echo ">>> Скачиваем шаблон: $TEMPLATE_NAME в хранилище $STORAGE..."
+if ! pveam list $STORAGE | grep -q "$TEMPLATE_NAME"; then
+  pveam download $STORAGE $TEMPLATE_NAME
+fi
 TEMPLATE_PATH="${STORAGE}:vztmpl/${TEMPLATE_NAME}"
-echo "TEMPLATE_PATH=${TEMPLATE_PATH}"
 
-echo "2) Создаём LXC (CTID=${CTID}) с enabled features (keyctl,nesting,fuse)..."
+# ========== ШАГ 3. Создание контейнера ==========
+echo ">>> Создаем LXC (CTID=$CTID)..."
 pct create ${CTID} ${TEMPLATE_PATH} \
   --hostname ${HOSTNAME} \
   --net0 name=eth0,bridge=${BRIDGE},ip=dhcp \
@@ -40,29 +51,24 @@ pct create ${CTID} ${TEMPLATE_PATH} \
   --onboot 1 \
   --features keyctl=1,nesting=1,fuse=1
 
-echo "3) Запускаем контейнер и ждём..."
 pct start ${CTID}
 sleep 6
-pct status ${CTID}
 
-echo "4) Установка Docker и зависимостей внутри контейнера..."
+# ========== ШАГ 4. Установка Docker и утилит ==========
+echo ">>> Устанавливаем Docker и зависимости в контейнер..."
 pct exec ${CTID} -- bash -lc "apt update && DEBIAN_FRONTEND=noninteractive apt install -y ca-certificates curl gnupg lsb-release apt-transport-https fuse-overlayfs"
-
-# Установим Docker официальным скриптом
 pct exec ${CTID} -- bash -lc "curl -fsSL https://get.docker.com | sh"
+pct exec ${CTID} -- bash -lc "apt install -y docker-compose-plugin"
 
-# Установим docker compose plugin (пакетный)
-pct exec ${CTID} -- bash -lc "apt update && DEBIAN_FRONTEND=noninteractive apt install -y docker-compose-plugin || true"
-
-# Прописать storage-driver (рекомендуется для unprivileged LXC)
 pct exec ${CTID} -- bash -lc 'cat > /etc/docker/daemon.json <<JSON
 {
   "storage-driver": "fuse-overlayfs"
 }
 JSON
-systemctl restart docker || echo \"systemctl restart docker failed (check logs)\"'
+systemctl restart docker || echo \"docker restart failed\"'
 
-echo "5) Создаём docker-compose для Dashy и поднимаем контейнер..."
+# ========== ШАГ 5. Dashy ==========
+echo ">>> Разворачиваем Dashy..."
 pct exec ${CTID} -- bash -lc 'mkdir -p /opt/dashy /opt/dashy/user-data && cat > /opt/dashy/docker-compose.yml <<EOF
 version: "3.8"
 services:
@@ -77,14 +83,9 @@ services:
 EOF
 cd /opt/dashy && docker compose up -d'
 
-echo "6) Установка Runtipi (официальный инсталлер)..."
+# ========== ШАГ 6. Runtipi ==========
+echo ">>> Устанавливаем Runtipi..."
 pct exec ${CTID} -- bash -lc "curl -L https://setup.runtipi.io | bash"
 
-echo "Готово. Проверим статус docker контейнеров:"
-pct exec ${CTID} -- bash -lc "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true"
-
-echo "Полезные команды:
-- Просмотреть логи LXC: pct console ${CTID}  (или pct exec ${CTID} -- journalctl -u docker -n 200)
-- Подключиться внутрь: pct enter ${CTID}
-- Перезапустить dashy: pct exec ${CTID} -- docker restart dashy
-"
+echo ">>> Всё готово! Проверка контейнеров:"
+pct exec ${CTID} -- docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
