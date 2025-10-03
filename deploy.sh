@@ -1,21 +1,32 @@
-!/bin/bash
+#!/bin/bash
 
 # This script must be run as root on the Proxmox host.
-# It creates an LXC container based on Debian 12, installs Docker inside it,
-# and then sets up Dashy, Dockge, and RunTipi using their respective installation methods.
+# It configures the no-subscription repository if needed, creates an LXC container based on Debian 12,
+# installs Docker inside it, and then sets up Dashy, Dockge, and RunTipi using their respective installation methods.
 # Customize variables as needed.
+
+# First, ensure no-subscription repository is configured
+echo "Configuring Proxmox no-subscription repository..."
+if ! grep -q "pve-no-subscription" /etc/apt/sources.list.d/pve-install-repo.list; then
+    echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
+    # Disable enterprise repo if it exists
+    if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
+        mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
+    fi
+    apt update
+fi
 
 # Variables for the LXC container
 CTID=100  # Change to a unique ID if needed
 HOSTNAME="dashy-container"
 STORAGE="local-lvm"  # Your storage name for rootfs, e.g., local-lvm or local
-DISKSIZE=15  # Disk size in GB (increased for apps and Docker images)
-MEMORY=2048  # Memory in MB
-CORES=2  # Number of cores
+DISKSIZE=16  # Disk size in GB (increased for apps and Docker images)
+MEMORY=4096  # Memory in MB
+CORES=4  # Number of cores
 BRIDGE="vmbr0"  # Network bridge
 IP="dhcp"  # Use 'dhcp' or static like '192.168.1.100/24,gw=192.168.1.1'
 PASSWORD="changeme"  # Change this to a secure password
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"  # Latest available as of search; update if needed
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"  # Latest available; update if needed
 
 # Check if template exists, download if not
 if [ ! -f "/var/lib/vz/template/cache/${TEMPLATE}" ]; then
