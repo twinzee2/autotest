@@ -1,100 +1,88 @@
-bash -s <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-trap 'echo "ERROR at line $LINENO"; exit 2' ERR
+#!/bin/bash
 
-# --------- Параметры (можно переопределить через env) ----------
-CTID=${CTID:-101}
-STORAGE=${STORAGE:-local}
-ROOTFS_GB=${ROOTFS_GB:-16}
-HOSTNAME=${HOSTNAME:-dashy-node}
-PASSWORD=${PASSWORD:-ChangeMeStrong!}
-CORES=${CORES:-2}
-MEMORY=${MEMORY:-2048}
-BRIDGE=${BRIDGE:-vmbr0}
-# --------------------------------------------------------------
+# This script must be run as root on the Proxmox host.
+# It creates an LXC container based on Debian 12, installs Docker inside it,
+# and then sets up Dashy, Dockge, and RunTipi using their respective installation methods.
+# Customize variables as needed.
 
-echo "=== 0) Настройка локалей (UTF-8) ==="
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y locales console-data >/dev/null 2>&1 || true
-if ! grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null; then
-  echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
-fi
-locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
-update-locale LANG=en_US.UTF-8 >/dev/null 2>&1 || true
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-echo "Locale set to: $LANG"
+# Variables for the LXC container
+CTID=100  # Change to a unique ID if needed
+HOSTNAME="dashy-container"
+STORAGE="local-lvm"  # Your storage name for rootfs, e.g., local-lvm or local
+DISKSIZE=15  # Disk size in GB (increased for apps and Docker images)
+MEMORY=2048  # Memory in MB
+CORES=2  # Number of cores
+BRIDGE="vmbr0"  # Network bridge
+IP="dhcp"  # Use 'dhcp' or static like '192.168.1.100/24,gw=192.168.1.1'
+PASSWORD="changeme"  # Change this to a secure password
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"  # Latest available as of search; update if needed
 
-echo "=== 1) Обновляем список шаблонов pveam ==="
-if ! pveam update >/dev/null 2>&1; then
-  echo "WARNING: pveam update failed — проверь интернет/прокси. Попробую продолжить."
+# Check if template exists, download if not
+if [ ! -f "/var/lib/vz/template/cache/${TEMPLATE}" ]; then
+    echo "Updating template list..."
+    pveam update
+    echo "Downloading Debian 12 template..."
+    pveam download local ${TEMPLATE}
+    if [ $? -ne 0 ]; then
+        echo "Failed to download template. Check available templates with 'pveam available --section system | grep debian-12' and update TEMPLATE variable."
+        exit 1
+    fi
 fi
 
-echo "=== 2) Ищем подходящий debian-*-standard шаблон ==="
-TEMPLATE_NAME=$(pveam available 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^debian-[0-9]+.*-standard.*\.tar\.zst$/) {print $i; exit}}' || true)
-if [ -z "$TEMPLATE_NAME" ]; then
-  TEMPLATE_NAME=$(pveam available 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^debian-.*-standard.*\.tar\.zst$/) {print $i; exit}}' || true)
+# Create the LXC container with nesting enabled for Docker
+echo "Creating LXC container ${CTID}..."
+pct create ${CTID} local:vztmpl/${TEMPLATE} \
+    --hostname ${HOSTNAME} \
+    --rootfs ${STORAGE}:${DISKSIZE} \
+    --net0 name=eth0,bridge=${BRIDGE},ip=${IP} \
+    --cores ${CORES} \
+    --memory ${MEMORY} \
+    --password ${PASSWORD} \
+    --ostype debian \
+    --features nesting=1,keyctl=1
+
+if [ $? -ne 0 ]; then
+    echo "Failed to create container."
+    exit 1
 fi
 
-if [ -z "$TEMPLATE_NAME" ]; then
-  echo "ERROR: не найден debian-*-standard шаблон в 'pveam available'. Вывод 'pveam available' для отладки:"
-  pveam available | sed -n '1,200p'
-  echo ""
-  echo "Если в выводе есть строка вроде 'debian-12-standard_12.7-1_amd64.tar.zst', скопируй её и скачай вручную:"
-  echo "  pveam download $STORAGE <имя-шаблона-из-вывода>"
-  exit 1
-fi
+# Start the container
+echo "Starting container ${CTID}..."
+pct start ${CTID}
+sleep 10  # Wait for container to start
 
-echo "Найден шаблон: $TEMPLATE_NAME"
-echo "=== 3) Скачиваем шаблон в storage: $STORAGE ==="
-pveam download "$STORAGE" "$TEMPLATE_NAME" || { echo "pveam download завершился с ошибкой"; exit 1; }
-TEMPLATE_PATH="${STORAGE}:vztmpl/${TEMPLATE_NAME}"
-echo "TEMPLATE_PATH = $TEMPLATE_PATH"
+# Update packages and install Docker inside the container
+echo "Installing Docker inside the container..."
+pct exec ${CTID} -- bash -c "apt update && apt upgrade -y && apt install -y ca-certificates curl gnupg"
+pct exec ${CTID} -- bash -c "install -m 0755 -d /etc/apt/keyrings"
+pct exec ${CTID} -- bash -c "curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc"
+pct exec ${CTID} -- bash -c "chmod a+r /etc/apt/keyrings/docker.asc"
+pct exec ${CTID} -- bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null'
+pct exec ${CTID} -- bash -c "apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 
-echo "=== 4) Создаём LXC (CTID=$CTID) ==="
-pct create "$CTID" "$TEMPLATE_PATH" \
-  --hostname "$HOSTNAME" \
-  --net0 name=eth0,bridge="$BRIDGE",ip=dhcp \
-  --cores "$CORES" --memory "$MEMORY" --rootfs "${STORAGE}:${ROOTFS_GB}" \
-  --password "$PASSWORD" --unprivileged 1 --onboot 1 \
-  --features keyctl=1,nesting=1,fuse=1
+# Install Dashy via Docker (basic setup; customize config as needed)
+echo "Installing Dashy..."
+pct exec ${CTID} -- bash -c "docker run -d -p 8080:80 --name dashy --restart=unless-stopped lissy93/dashy"
+# Note: Access at http://container-ip:8080. Create /app/public/conf.yml volume for config if needed.
 
-echo "Запускаю контейнер..."
-pct start "$CTID"
-sleep 6
+# Install Dockge via Docker
+echo "Installing Dockge..."
+pct exec ${CTID} -- bash -c "mkdir -p /opt/dockge/data /opt/dockge/stacks"
+pct exec ${CTID} -- bash -c "docker run -d --name dockge -p 5001:5001 -v /var/run/docker.sock:/var/run/docker.sock -v /opt/dockge/data:/app/data -v /opt/dockge/stacks:/opt/stacks --restart unless-stopped louislam/dockge"
+# Note: Access at http://container-ip:5001
 
-echo "=== 5) Устанавливаем Docker и зависимости внутри контейнера ==="
-pct exec "$CTID" -- bash -lc "apt update && DEBIAN_FRONTEND=noninteractive apt install -y ca-certificates curl gnupg lsb-release apt-transport-https fuse-overlayfs"
-pct exec "$CTID" -- bash -lc "curl -fsSL https://get.docker.com | sh"
-pct exec "$CTID" -- bash -lc "apt-get install -y docker-compose-plugin || true"
+# Install RunTipi
+echo "Installing RunTipi..."
+pct exec ${CTID} -- bash -c "apt install -y git"  # Needed for RunTipi if not already
+pct exec ${CTID} -- bash -c "curl -L https://setup.runtipi.io | bash"
+pct exec ${CTID} -- bash -c "cd /root/runtipi && ./tipi run"
+# Note: RunTipi installs in /root/runtipi by default. Access at http://container-ip:80 (or configured port). Check RunTipi docs for further config.
 
-pct exec "$CTID" -- bash -lc 'cat >/etc/docker/daemon.json <<JSON
-{
-  "storage-driver": "fuse-overlayfs"
-}
-JSON
-systemctl restart docker || true'
-
-echo "=== 6) Разворачиваем Dashy (docker compose) ==="
-pct exec "$CTID" -- bash -lc 'mkdir -p /opt/dashy/user-data && cat >/opt/dashy/docker-compose.yml <<EOF
-version: "3.8"
-services:
-  dashy:
-    image: ghcr.io/lissy93/dashy:latest
-    container_name: dashy
-    ports:
-      - "8080:80"
-    volumes:
-      - /opt/dashy/user-data:/app/user-data
-    restart: unless-stopped
-EOF
-cd /opt/dashy && docker compose up -d || docker compose up -d || true'
-
-echo "=== 7) Устанавливаем Runtipi (официальный инсталлер) ==="
-pct exec "$CTID" -- bash -lc "curl -L https://setup.runtipi.io | bash || true"
-
-echo "=== DONE ==="
-pct exec "$CTID" -- docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
-echo "Если нужно — подключись: pct enter $CTID"
-SCRIPT
+echo "Installation complete! Container ID: ${CTID}"
+echo "Login to container with: pct enter ${CTID}"
+echo "Check services:"
+echo "- Dashy: http://<container-ip>:8080"
+echo "- Dockge: http://<container-ip>:5001"
+echo "- RunTipi: http://<container-ip>:80 (default)"
+echo "Note: If using static IP, set it in variables. Ensure ports are not conflicting and firewall allows them."
+echo "For production, secure passwords, expose ports properly, and configure each app."
