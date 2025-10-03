@@ -1,4 +1,4 @@
-#!/bin/bash
+!/bin/bash
 
 # This script must be run as root on the Proxmox host.
 # It creates an LXC container based on Debian 12, installs Docker inside it,
