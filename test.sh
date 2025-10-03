@@ -30,7 +30,7 @@ CORES=4  # Number of cores
 BRIDGE="vmbr0"  # Network bridge
 IP="dhcp"  # Use 'dhcp' or static like '192.168.1.100/24,gw=192.168.1.1'
 PASSWORD="changeme"  # Change this to a secure password
-TEMPLATE="debian-12-standard_12.2-1_amd64.tar.zst"  # Updated to correct filename; verify with pveam available if needed
+TEMPLATE="debian-12-standard_12.12-1_amd64.tar.zst"  # Updated to the latest available as of October 2025
 
 # Check if template exists, download if not
 if [ ! -f "/var/lib/vz/template/cache/${TEMPLATE}" ]; then
