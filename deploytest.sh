@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Предупреждение: Этот скрипт предназначен для Proxmox VE без подписки. Он создаст LXC контейнер на Debian 12,
+# Предупреждение: Этот скрипт предназначен для Proxmox VE 9.0 без подписки. Он создаст LXC контейнер на Debian 13,
 # установит Docker, Dockge, Runtipi и Dashy с базовой конфигурацией (логины/пароли admin/admin где применимо).
 # Ресурсы: 4 ядра, 12 ГБ RAM, 500 ГБ виртуальный диск (физический диск хоста должен иметь достаточно места;
 # если хост имеет только 128 ГБ, это может привести к overcommitment — мониторьте использование).
@@ -16,23 +16,38 @@ LXC_CORES=4
 LXC_MEMORY=12288  # 12 ГБ в МБ
 LXC_SWAP=4096     # 4 ГБ swap
 LXC_DISK_SIZE=500 # ГБ
-LXC_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
-LXC_STORAGE="local-lvm"  # Измените на ваш storage (local-lvm или local-zfs)
+LXC_TEMPLATE="debian-13-standard_13.0-1_amd64.tar.zst"
+LXC_STORAGE="local-lvm"  # Измените на ваш storage для rootfs (local-lvm или local-zfs), но templates в 'local'
 BRIDGE="vmbr0"    # Мост сети
 
-# Шаг 1: Обновление Proxmox и добавление no-subscription repo (если не добавлено)
-if ! grep -q "deb https://download.proxmox.com/debian/pve bookworm pve-no-subscription" /etc/apt/sources.list.d/pve-install-repo.list; then
-    echo "Добавляем no-subscription репозиторий..."
-    echo "deb https://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
-    # Отключаем enterprise repo
-    sed -i 's/^deb/#deb/' /etc/apt/sources.list.d/pve-enterprise.list || true
+# Шаг 1: Отключение всех enterprise репозиториев
+echo "Отключаем все enterprise репозитории..."
+for file in /etc/apt/sources.list.d/*; do
+    if grep -q "enterprise.proxmox.com" "$file"; then
+        sed -i 's/^deb/#deb/' "$file" || true
+    fi
+done
+
+# Добавление no-subscription репозиториев для PVE и Ceph
+if ! grep -q "deb https://download.proxmox.com/debian/pve trixie pve-no-subscription" /etc/apt/sources.list.d/pve-no-subscription.list; then
+    echo "Добавляем no-subscription репозиторий для PVE..."
+    echo "deb https://download.proxmox.com/debian/pve trixie pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
 fi
+
+if ! grep -q "deb http://download.proxmox.com/debian/ceph-squid trixie no-subscription" /etc/apt/sources.list.d/ceph-no-subscription.list; then
+    echo "Добавляем no-subscription репозиторий для Ceph..."
+    echo "deb http://download.proxmox.com/debian/ceph-squid trixie no-subscription" > /etc/apt/sources.list.d/ceph-no-subscription.list
+fi
+
+# Обновление системы
 apt update && apt full-upgrade -y
 
-# Шаг 2: Скачивание шаблона Debian 12, если не существует
+# Шаг 2: Обновление шаблонов и скачивание Debian 13, если не существует
+echo "Обновляем список шаблонов..."
+pveam update
+
 if [ ! -f "/var/lib/vz/template/cache/$LXC_TEMPLATE" ]; then
-    echo "Скачиваем шаблон Debian 12..."
-    pveam update
+    echo "Скачиваем шаблон Debian 13..."
     pveam download local $LXC_TEMPLATE
 fi
 
@@ -72,7 +87,7 @@ echo "Устанавливаем приложения внутри LXC..."
 pct exec $LXC_ID -- bash -c "
     set -e
     apt update && apt upgrade -y
-    apt install -y curl sudo git
+    apt install -y curl sudo git apache2-utils  # Добавлен apache2-utils для htpasswd
 
     # Установка Docker
     curl -fsSL https://get.docker.com -o get-docker.sh
