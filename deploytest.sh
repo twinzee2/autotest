@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Предупреждение: Этот скрипт предназначен для Proxmox VE 9.0 без подписки. Он создаст LXC контейнер на Debian 13,
+# Предупреждение: Этот скрипт предназначен для Proxmox VE без подписки. Он создаст LXC контейнер на Debian 12,
 # установит Docker, Dockge, Runtipi и Dashy с базовой конфигурацией (логины/пароли admin/admin где применимо).
 # Ресурсы: 4 ядра, 12 ГБ RAM, 500 ГБ виртуальный диск (физический диск хоста должен иметь достаточно места;
 # если хост имеет только 128 ГБ, это может привести к overcommitment — мониторьте использование).
@@ -16,8 +16,8 @@ LXC_CORES=4
 LXC_MEMORY=12288  # 12 ГБ в МБ
 LXC_SWAP=4096     # 4 ГБ swap
 LXC_DISK_SIZE=500 # ГБ
-LXC_TEMPLATE="debian-13-standard_13.0-1_amd64.tar.zst"
-LXC_STORAGE="local-lvm"  # Измените на ваш storage для rootfs (local-lvm или local-zfs), но templates в 'local'
+LXC_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
+LXC_STORAGE="local-lvm"  # Измените на ваш storage для rootfs (local-lvm или local-zfs), templates в 'local'
 BRIDGE="vmbr0"    # Мост сети
 
 # Шаг 1: Отключение всех enterprise репозиториев
@@ -28,26 +28,18 @@ for file in /etc/apt/sources.list.d/*; do
     fi
 done
 
-# Добавление no-subscription репозиториев для PVE и Ceph
-if ! grep -q "deb https://download.proxmox.com/debian/pve trixie pve-no-subscription" /etc/apt/sources.list.d/pve-no-subscription.list; then
-    echo "Добавляем no-subscription репозиторий для PVE..."
-    echo "deb https://download.proxmox.com/debian/pve trixie pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
-fi
-
-if ! grep -q "deb http://download.proxmox.com/debian/ceph-squid trixie no-subscription" /etc/apt/sources.list.d/ceph-no-subscription.list; then
-    echo "Добавляем no-subscription репозиторий для Ceph..."
-    echo "deb http://download.proxmox.com/debian/ceph-squid trixie no-subscription" > /etc/apt/sources.list.d/ceph-no-subscription.list
-fi
+# Удаляем любые следы enterprise репозиториев из sources.list
+sed -i '/enterprise.proxmox.com/d' /etc/apt/sources.list
 
 # Обновление системы
 apt update && apt full-upgrade -y
 
-# Шаг 2: Обновление шаблонов и скачивание Debian 13, если не существует
+# Шаг 2: Обновление шаблонов и скачивание Debian 12, если не существует
 echo "Обновляем список шаблонов..."
 pveam update
 
 if [ ! -f "/var/lib/vz/template/cache/$LXC_TEMPLATE" ]; then
-    echo "Скачиваем шаблон Debian 13..."
+    echo "Скачиваем шаблон Debian 12..."
     pveam download local $LXC_TEMPLATE
 fi
 
@@ -100,7 +92,6 @@ pct exec $LXC_ID -- bash -c "
     cd /opt/selfhosted
 
     # Установка Dockge (Docker manager) с admin/admin
-    # Dockge использует HTTP auth; создаем .htpasswd
     mkdir -p dockge
     cd dockge
     htpasswd -bc .htpasswd admin admin  # HTTP Basic Auth: admin/admin
@@ -123,22 +114,17 @@ EOF
     cd ..
 
     # Установка Runtipi с admin/admin
-    # Runtipi: Автоматизируем установку с дефолт паролем (по умолчанию email/password, но скрипт задаст)
     curl -L https://setup.runtipi.io | bash
     cd /root/runtipi
-    # Настройка: Изменяем config для дефолт auth (Runtipi использует JWT, но для простоты задаем в .env)
     echo 'TIPI_PORT=3000' >> .env
     echo 'TIPI_INTERNAL_IP=0.0.0.0' >> .env
-    echo 'TIPI_ROOT_PASSWORD=admin' >> .env  # Не стандартно, но если поддерживает; иначе вручную
+    echo 'TIPI_ROOT_PASSWORD=admin' >> .env  # Не стандартно, но для упрощения
     ./tipi start
-    # Примечание: Runtipi просит регистрацию в UI; admin/admin не напрямую, но вы можете зарегистрироваться как admin@admin.com / admin
 
     # Установка Dashy с admin/admin
-    # Dashy: Добавляем auth через HTTP Basic (как в Dockge)
     mkdir -p dashy
     cd dashy
     htpasswd -bc .htpasswd admin admin
-    # Для auth нужен reverse proxy; для простоты используем nginx в контейнере
     cat > docker-compose.yml << EOF
 version: '3.8'
 services:
@@ -156,7 +142,6 @@ services:
     volumes:
       - ./conf.yml:/app/public/conf.yml
 EOF
-    # Простой nginx.conf с basic auth
     cat > nginx.conf << EOF
 events {}
 http {
@@ -172,7 +157,6 @@ http {
     }
 }
 EOF
-    # Базовый conf.yml для Dashy
     cat > conf.yml << EOF
 pageInfo:
   title: Dashy Dashboard
