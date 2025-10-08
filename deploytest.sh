@@ -1,174 +1,164 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-# Предупреждение: Этот скрипт предназначен для Proxmox VE без подписки. Он создаст LXC контейнер на Debian 12,
-# установит Docker, Dockge, Runtipi и Dashy с базовой конфигурацией (логины/пароли admin/admin где применимо).
-# Ресурсы: 4 ядра, 12 ГБ RAM, 500 ГБ виртуальный диск (физический диск хоста должен иметь достаточно места;
-# если хост имеет только 128 ГБ, это может привести к overcommitment — мониторьте использование).
-# IP по DHCP. Скрипт предполагает, что Proxmox установлен и вы запускаете его как root.
-# Не используем enterprise репозитории.
+log() { echo "[$(date +'%F %T')] $*"; }
 
-set -e  # Выходим при ошибке
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Запусти скрипт от root (sudo)."
+  exit 1
+fi
 
-# Константы
-LXC_ID=100  # ID контейнера, измените если нужно
-LXC_HOSTNAME="lxc-apps"
-LXC_CORES=4
-LXC_MEMORY=12288  # 12 ГБ в МБ
-LXC_SWAP=4096     # 4 ГБ swap
-LXC_DISK_SIZE=500 # ГБ
-LXC_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
-LXC_STORAGE="local-lvm"  # Измените на ваш storage для rootfs (local-lvm или local-zfs), templates в 'local'
-BRIDGE="vmbr0"    # Мост сети
+# --- Отключаем enterprise repo и добавляем no-subscription ---
+if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
+  log "Disabling /etc/apt/sources.list.d/pve-enterprise.list"
+  mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled || true
+fi
 
-# Шаг 1: Отключение всех enterprise репозиториев
-echo "Отключаем все enterprise репозитории..."
-for file in /etc/apt/sources.list.d/*; do
-    if grep -q "enterprise.proxmox.com" "$file"; then
-        sed -i 's/^deb/#deb/' "$file" || true
-    fi
+cat > /etc/apt/sources.list.d/pve-no-subscription.list <<'EOF'
+deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription
+EOF
+
+log "Обновляем пакеты"
+apt update -y || true
+apt install -y curl wget gnupg2 lsb-release apt-transport-https ca-certificates
+
+# --- Обновляем список шаблонов и находим Debian 12 template ---
+log "Обновляем список шаблонов pveam"
+pveam update || true
+
+TEMPLATE=$(pveam available | grep -m1 -E 'debian-12-standard' | awk '{print $1}' || true)
+if [ -z "$TEMPLATE" ]; then
+  log "Не найден debian-12-standard в списке pveam. Пытаюсь ещё раз..."
+  pveam update || true
+  TEMPLATE=$(pveam available | grep -m1 -E 'debian-12-standard' | awk '{print $1}' || true)
+fi
+if [ -z "$TEMPLATE" ]; then
+  log "Не удалось найти шаблон Debian 12 (debian-12-standard). Прекращаю."
+  exit 1
+fi
+log "Найден шаблон: $TEMPLATE"
+
+# --- Выбираем хранилища ---
+STORAGE_DIR=$(pvesm status 2>/dev/null | awk 'NR>1 && $2=="dir" {print $1; exit}' || true)
+if [ -z "$STORAGE_DIR" ]; then
+  STORAGE_DIR=$(pvesm status 2>/dev/null | awk 'NR>1 {print $1; exit}' || true)
+fi
+if [ -z "$STORAGE_DIR" ]; then
+  log "Не найдено доступных хранилищ (pvesm). Прекращаю."
+  exit 1
+fi
+
+# для rootfs (попробуем lvmthin/zfs/dir по приоритету)
+STORAGE_ROOT=$(pvesm status 2>/dev/null | awk 'NR>1 && ($2=="lvmthin" || $2=="zfspool" || $2=="zfs" || $2=="dir") {print $1; exit}' || true)
+if [ -z "$STORAGE_ROOT" ]; then
+  STORAGE_ROOT=$STORAGE_DIR
+fi
+
+log "Шаблоны будут скачаны в storage (dir): $STORAGE_DIR"
+log "Rootfs контейнера будет размещён в: $STORAGE_ROOT"
+
+# --- Скачиваем шаблон ---
+log "Скачиваю шаблон: $TEMPLATE -> storage $STORAGE_DIR"
+pveam download "$STORAGE_DIR" "$TEMPLATE"
+
+TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
+if [ ! -f "$TEMPLATE_PATH" ]; then
+  log "Ожидал найти шаблон по пути $TEMPLATE_PATH, но не нашёл. Прекращаю."
+  exit 1
+fi
+
+# --- Получаем следующий свободный VMID ---
+VMID=$(pvesh get /cluster/nextid 2>/dev/null || true)
+if [ -z "$VMID" ]; then
+  log "Не удалось получить nextid через pvesh. Прекращаю."
+  exit 1
+fi
+
+# --- Ищем бридж (vmbr0 или любой доступный) ---
+BRIDGE="vmbr0"
+if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+  BRIDGE=$(ip -o link show | awk -F': ' '/br[0-9]/{print $2; exit}' || true)
+  if [ -z "$BRIDGE" ]; then
+    log "Не обнаружен bridge vmbr0 и нет других bridge-интерфейсов. Прекрати."
+    exit 1
+  fi
+fi
+log "Использую bridge: $BRIDGE"
+
+# --- Параметры контейнера ---
+HOSTNAME="lxc-debian12"
+CORES=4
+MEM=12288   # в MB = 12GB
+ROOTFS_SIZE="500G"
+
+log "Создаю LXC (vmid=$VMID) с $CORES CPU, $MEM MB RAM, $ROOTFS_SIZE rootfs..."
+# Привилегированный контейнер + nesting для Docker
+pct create "$VMID" "$TEMPLATE_PATH" --cores "$CORES" --memory "$MEM" --swap 0 \
+  --hostname "$HOSTNAME" --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
+  --rootfs "${STORAGE_ROOT}:${ROOTFS_SIZE}" --unprivileged 0 --features nesting=1,keyctl=1 --start 1
+
+log "Контейнер создан и запущен. Ожидаю получения IP по DHCP..."
+
+# --- Ожидаем IP в контейнере ---
+IP=""
+for i in $(seq 1 40); do
+  sleep 3
+  # получаем первый непустой IPv4 адрес
+  IP=$(pct exec "$VMID" -- bash -lc "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | grep -v '^127.' | head -n1" 2>/dev/null || true)
+  if [ -n "$IP" ]; then
+    break
+  fi
+  log "Ожидание IP... попытка $i/40"
 done
 
-# Удаляем любые следы enterprise репозиториев из sources.list
-sed -i '/enterprise.proxmox.com/d' /etc/apt/sources.list
-
-# Обновление системы
-apt update && apt full-upgrade -y
-
-# Шаг 2: Обновление шаблонов и скачивание Debian 12, если не существует
-echo "Обновляем список шаблонов..."
-pveam update
-
-if [ ! -f "/var/lib/vz/template/cache/$LXC_TEMPLATE" ]; then
-    echo "Скачиваем шаблон Debian 12..."
-    pveam download local $LXC_TEMPLATE
+if [ -z "$IP" ]; then
+  log "Контейнер не получил IP по DHCP в течение ожидаемого времени. Проверь сеть/браидж."
+  pct status "$VMID" || true
+  exit 1
 fi
 
-# Шаг 3: Создание LXC контейнера
-if pct status $LXC_ID &>/dev/null; then
-    echo "LXC $LXC_ID уже существует. Останавливаем и удаляем..."
-    pct stop $LXC_ID || true
-    pct destroy $LXC_ID --force
-fi
+log "Контейнер $VMID получил IP: $IP"
 
-echo "Создаем LXC контейнер..."
-pct create $LXC_ID local:vztmpl/$LXC_TEMPLATE \
-    --hostname $LXC_HOSTNAME \
-    --cores $LXC_CORES \
-    --memory $LXC_MEMORY \
-    --swap $LXC_SWAP \
-    --rootfs $LXC_STORAGE:$LXC_DISK_SIZE \
-    --net0 name=eth0,bridge=$BRIDGE,ip=dhcp \
-    --features nesting=1  # Для Docker внутри LXC
-pct set $LXC_ID -unprivileged 0  # Привилегированный для Docker (рекомендуется для стабильности)
+# --- Установка Docker внутри контейнера ---
+log "Устанавливаю Docker внутри контейнера $VMID..."
+pct exec "$VMID" -- bash -lc "set -e; apt update; DEBIAN_FRONTEND=noninteractive apt install -y ca-certificates curl gnupg lsb-release apt-transport-https; \
+  mkdir -p /etc/apt/keyrings; \
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmour -o /etc/apt/keyrings/docker.gpg || true; \
+  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list; \
+  apt update; DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin || true"
 
-# Шаг 4: Запуск контейнера
-echo "Запускаем LXC контейнер..."
-pct start $LXC_ID
+# Попытка запустить Docker (в LXC systemd должен работать)
+pct exec "$VMID" -- bash -lc "systemctl enable --now docker || true"
 
-# Ждем, пока контейнер запустится и получит IP
-sleep 10
-LXC_IP=$(pct exec $LXC_ID -- ip addr show eth0 | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-if [ -z "$LXC_IP" ]; then
-    echo "Ошибка: Не удалось получить IP. Проверьте DHCP."
-    exit 1
-fi
+# --- Разворачиваем Portainer (UI для Docker) ---
+log "Устанавливаю Portainer (Docker GUI)..."
+pct exec "$VMID" -- bash -lc "docker volume create portainer_data >/dev/null 2>&1 || true; \
+  docker run -d --name portainer --restart=always -p 9000:9000 -p 8000:8000 \
+    -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest >/dev/null 2>&1 || true"
 
-# Шаг 5: Установка пакетов и приложений внутри LXC
-echo "Устанавливаем приложения внутри LXC..."
+# --- Разворачиваем Dashy (простой статический образ в контейнере) ---
+log "Устанавливаю Dashy (панель ссылок)..."
+pct exec "$VMID" -- bash -lc "mkdir -p /opt/dashy; \
+  docker run -d --name dashy --restart unless-stopped -p 8080:80 -v /opt/dashy:/dashy ghcr.io/lissy93/dashy:latest >/dev/null 2>&1 || true"
 
-pct exec $LXC_ID -- bash -c "
-    set -e
-    apt update && apt upgrade -y
-    apt install -y curl sudo git apache2-utils  # Добавлен apache2-utils для htpasswd
+# --- Пробуем установить Runtipi (если образ доступен) ---
+log "Пробую запустить Runtipi (если образ доступен)..."
+pct exec "$VMID" -- bash -lc "docker run -d --name runtipi --restart unless-stopped -p 3000:3000 twinzee/runtipi:latest >/dev/null 2>&1 || echo 'Runtipi image not found / failed to run'"
 
-    # Установка Docker
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    apt install -y docker-compose-plugin  # Для docker compose v2
-    usermod -aG docker root  # Для root (поскольку скрипт как root)
+# --- Финальный вывод ---
+cat <<EOF
 
-    # Создание директории для приложений
-    mkdir -p /opt/selfhosted
-    cd /opt/selfhosted
+Ваш сервер настроен и доступен по адресу: ${IP}
 
-    # Установка Dockge (Docker manager) с admin/admin
-    mkdir -p dockge
-    cd dockge
-    htpasswd -bc .htpasswd admin admin  # HTTP Basic Auth: admin/admin
-    cat > docker-compose.yml << EOF
-version: '3.8'
-services:
-  dockge:
-    image: louislam/dockge:1
-    restart: unless-stopped
-    ports:
-      - '5001:5001'
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - /opt/stacks:/opt/stacks
-    environment:
-      - DOCKGE_STACKS_DIR=/opt/stacks
+Сервисы (если успешно запущены):
+ - Portainer:  http://${IP}:9000
+ - Dashy:      http://${IP}:8080
+ - Runtipi:    http://${IP}:3000   (если образ был доступен)
+
+VMID контейнера: $VMID
+Шаблон: $TEMPLATE
+
 EOF
-    docker compose up -d
-    cd ..
 
-    # Установка Runtipi с admin/admin
-    curl -L https://setup.runtipi.io | bash
-    cd /root/runtipi
-    echo 'TIPI_PORT=3000' >> .env
-    echo 'TIPI_INTERNAL_IP=0.0.0.0' >> .env
-    echo 'TIPI_ROOT_PASSWORD=admin' >> .env  # Не стандартно, но для упрощения
-    ./tipi start
-
-    # Установка Dashy с admin/admin
-    mkdir -p dashy
-    cd dashy
-    htpasswd -bc .htpasswd admin admin
-    cat > docker-compose.yml << EOF
-version: '3.8'
-services:
-  nginx:
-    image: nginx:latest
-    restart: unless-stopped
-    ports:
-      - '8080:80'
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./.htpasswd:/etc/nginx/.htpasswd:ro
-  dashy:
-    image: lissy93/dashy:latest
-    restart: unless-stopped
-    volumes:
-      - ./conf.yml:/app/public/conf.yml
-EOF
-    cat > nginx.conf << EOF
-events {}
-http {
-    server {
-        listen 80;
-        location / {
-            auth_basic 'Restricted';
-            auth_basic_user_file /etc/nginx/.htpasswd;
-            proxy_pass http://dashy:80;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-        }
-    }
-}
-EOF
-    cat > conf.yml << EOF
-pageInfo:
-  title: Dashy Dashboard
-sections: []
-EOF
-    docker compose up -d
-"
-
-# Шаг 6: Финальный вывод
-echo "Ваш сервер настроен и доступен по адресу $LXC_IP"
-echo "Доступы:"
-echo "- Dockge: http://$LXC_IP:5001 (логин/пароль: admin/admin)"
-echo "- Runtipi: http://$LXC_IP:3000 (зарегистрируйтесь как admin@admin.com / admin)"
-echo "- Dashy: http://$LXC_IP:8080 (логин/пароль: admin/admin)"
-echo "Остальные приложения устанавливайте через Runtipi UI или Dockge."
+log "Готово."
